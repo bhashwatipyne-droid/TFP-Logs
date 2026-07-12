@@ -14,27 +14,31 @@ Future sources can be added without changing the warehouse architecture.
 ---
 
 # Project Structure
+## Project Structure
 
-finpedia_log_analysis/
-
+```text
+finpedia-log-system/
 │
 ├── logs/
 │   ├── api/
 │   └── cobrand/
 │
 ├── etl/
-│   ├── api_loader.py
-│   └── cobrand_loader.py
+│   ├── api_loader.py        # Loads API logs into DB
+│   └── cobrand_loader.py    # Loads cobrand logs into DB
 │
 ├── parsers/
-│   └── parser.py
+│   └── parser.py            # Parses raw log data
 │
-├── refresh_logs.py
+├── refresh_logs.py          # Main refresh script
 │
-├── finpedia_logs.db
+├── finpedia_logs.db         # SQLite database
 │
-└── README.md
+└── README.md                # Documentation
 ```
+
+
+
 
 # Folder Explanation
 
