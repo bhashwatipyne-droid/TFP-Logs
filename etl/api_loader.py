@@ -75,8 +75,14 @@ def refresh():
             INSERT INTO raw_logs_api
             SELECT
                 '{filename}',
-                json
-            FROM read_json_auto('{log_file}')
+                json(line)
+            FROM read_csv(
+                '{log_file}',
+                columns={{'line':'VARCHAR'}},
+                delim='\\n',
+                quote='',
+                escape=''
+            )
         """)
 
         new_files += 1
