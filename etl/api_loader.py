@@ -1,17 +1,97 @@
-import duckdb
+import json
+import logging
 import glob
 import os
 
+import duckdb
+
+logger = logging.getLogger(__name__)
+
+
+def _import_log_file(con, log_file: str, filename: str) -> int:
+    """
+    Read a JSON-lines log file directly in Python and insert each
+    valid line into raw_logs_api.
+
+    Bypasses DuckDB's read_csv, which was previously used as a
+    line-splitting trick (delim='\\n', one VARCHAR column per line).
+    That approach broke starting with the 2026-07-12 logs: DuckDB's
+    CSV sniffer inspects the file before honoring the delim/quote/
+    escape overrides, and the nested trace.method/children structures
+    introduced on 2026-07-12 contain enough commas that the sniffer
+    guessed 5 columns instead of the 1 we declared, raising
+    InvalidInputException. Reading the file natively in Python sidesteps
+    CSV parsing entirely, and lets us validate + skip bad lines
+    individually instead of failing the whole file.
+    """
+    rows = []
+    skipped = 0
+
+    with open(log_file, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                json.loads(line)  # validate it's real JSON before inserting
+            except json.JSONDecodeError as ex:
+                logger.warning(
+                    "%s line %d: skipping invalid JSON (%s)",
+                    filename, line_no, ex,
+                )
+                skipped += 1
+                continue
+            rows.append((filename, line))
+
+    if rows:
+        con.executemany(
+            "INSERT INTO raw_logs_api SELECT ?, json(?)",
+            rows,
+        )
+
+    if skipped:
+        logger.warning("%s: skipped %d malformed line(s)", filename, skipped)
+
+    return len(rows)
+
 
 def refresh():
+    """
+    Refresh the API log warehouse.
 
-    print("=" * 60)
-    print("TheFinpedia Log Refresh")
-    print("=" * 60)
+    Returns
+    -------
+    list[str]
+        Paths (as they appeared in the logs/api/*.log glob) of every
+        log file that is confirmed present in raw_logs_api after this
+        run — i.e. files imported just now, plus files that were
+        already imported in a prior run. This is the list that should
+        be handed to archive_logs("logs/archive/api") downstream;
+        anything not in this list failed to import and should not be
+        archived.
+    """
+
+    logger.info("=" * 60)
+    logger.info("TheFinpedia Log Refresh")
+    logger.info("=" * 60)
 
     con = duckdb.connect("finpedia_logs.db")
 
-    print("Connected successfully.")
+    # Everything happens inside try/finally so the connection is always
+    # closed — and the file lock released — even if something raises
+    # partway through. Without this, an interrupted or crashed run can
+    # leave finpedia_logs.db locked for the *next* run (this is exactly
+    # what caused the "Conflicting lock is held" error).
+    try:
+        return _run_refresh(con)
+    finally:
+        con.close()
+
+
+def _run_refresh(con):
+
+    logger.info("Connected successfully.")
+
     # ---------------------------------------------------------
     # Ensure raw_logs exists
     # ---------------------------------------------------------
@@ -23,7 +103,7 @@ def refresh():
     )
     """)
 
-    print("✓ raw_logs table ready.")
+    logger.info("raw_logs table ready.")
 
     # ---------------------------------------------------------
     # Find already imported log files
@@ -37,67 +117,64 @@ def refresh():
         """).fetchall()
     }
 
-    print(f"Already imported : {len(existing_files)} file(s)")
+    logger.info("Already imported : %d file(s)", len(existing_files))
 
-    print("\nSearching for log files...")
+    logger.info("Searching for log files...")
 
     log_files = sorted(glob.glob("logs/api/*.log"))
 
     if not log_files:
-        print("❌ No log files found.")
-        return
+        logger.info("No log files found.")
+        return []
 
-    print(f"Found {len(log_files)} log files.\n")
+    logger.info("Found %d log files.", len(log_files))
 
     for log_file in log_files:
 
         filename = os.path.basename(log_file)
 
         if filename in existing_files:
-            print(f"✓ {filename} (already imported)")
+            logger.info("%s (already imported)", filename)
         else:
-            print(f"○ {filename} (new)")
+            logger.info("%s (new)", filename)
 
-    print("\nImporting new log files...\n")
+    logger.info("Importing new log files...")
 
     new_files = 0
+    processed_files = []
 
     for log_file in log_files:
 
         filename = os.path.basename(log_file)
 
         if filename in existing_files:
+            # Already in the warehouse from a prior run. Still eligible
+            # for archiving if the .log file is still sitting on disk.
+            processed_files.append(log_file)
             continue
 
-        print(f"→ Importing {filename}")
+        logger.info("Importing %s", filename)
 
-        con.execute(f"""
-            INSERT INTO raw_logs_api
-            SELECT
-                '{filename}',
-                json(line)
-            FROM read_csv(
-                '{log_file}',
-                columns={{'line':'VARCHAR'}},
-                delim='\\n',
-                quote='',
-                escape=''
-            )
-        """)
+        try:
+            imported_rows = _import_log_file(con, log_file, filename)
+        except Exception as ex:
+            logger.error("Failed to import %s: %s", filename, ex)
+            continue
+
+        logger.info("%s: inserted %d row(s)", filename, imported_rows)
 
         new_files += 1
-
-    print()
+        processed_files.append(log_file)
 
     if new_files == 0:
-        print("✓ No new log files to import.")
+        logger.info("No new log files to import.")
     else:
-        print(f"✓ Imported {new_files} new file(s).")
+        logger.info("Imported %d new file(s).", new_files)
 
+    logger.info("Current files in warehouse:")
 
-    print("\nCurrent files in warehouse:\n")
-
-    print(
+    logger.info(
+        "\n%s",
         con.execute("""
             SELECT
                 source_file,
@@ -108,8 +185,7 @@ def refresh():
         """).fetchdf()
     )
 
-
-    print("\nRebuilding event_fact...")
+    logger.info("Rebuilding event_fact...")
 
     con.execute("DROP TABLE IF EXISTS event_fact_api")
 
@@ -161,9 +237,9 @@ def refresh():
     FROM event_fact_api
     """).fetchone()[0]
 
-    print(f"✓ event_fact_api rebuilt ({rows:,} rows)")
+    logger.info("event_fact_api rebuilt (%s rows)", f"{rows:,}")
 
-    print("\nRebuilding event_catalog_api...")
+    logger.info("Rebuilding event_catalog_api...")
 
     con.execute("DROP TABLE IF EXISTS event_catalog_api")
 
@@ -199,9 +275,9 @@ def refresh():
     FROM event_catalog_api
     """).fetchone()[0]
 
-    print(f"✓ event_catalog_apirebuilt ({events:,} unique events)")
+    logger.info("event_catalog_api rebuilt (%s unique events)", f"{events:,}")
 
-    print("\nSynchronizing capability_catalog...")
+    logger.info("Synchronizing capability_catalog...")
 
     # Create table if it doesn't exist
     con.execute("""
@@ -284,13 +360,12 @@ def refresh():
 
     """).fetchone()[0]
 
-    print(f"✓ capability_catalog synchronized ({total_prefixes} prefixes)")
-    print(f"✓ {new_prefixes} prefix(es) require classification")
+    logger.info("capability_catalog synchronized (%d prefixes)", total_prefixes)
+    logger.info("%d prefix(es) require classification", new_prefixes)
 
-
-    print("\n" + "=" * 60)
-    print("Warehouse Refresh Complete")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Warehouse Refresh Complete")
+    logger.info("=" * 60)
 
     raw_rows = con.execute("""
     SELECT COUNT(*)
@@ -312,28 +387,34 @@ def refresh():
     FROM capability_catalog
     """).fetchone()[0]
 
-    print(f"Raw Logs           : {raw_rows:,}")
-    print(f"Event Facts        : {fact_rows:,}")
-    print(f"Unique Events      : {event_count:,}")
-    print(f"Capabilities       : {capability_count:,}")
-    print(f"Unclassified       : {new_prefixes:,}")
+    logger.info("Raw Logs           : %s", f"{raw_rows:,}")
+    logger.info("Event Facts        : %s", f"{fact_rows:,}")
+    logger.info("Unique Events      : %s", f"{event_count:,}")
+    logger.info("Capabilities       : %s", f"{capability_count:,}")
+    logger.info("Unclassified       : %s", f"{new_prefixes:,}")
 
-    print("=" * 60)
-    print("Warehouse Ready")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("Warehouse Ready")
+    logger.info("=" * 60)
 
-    # Print any prefixes that still need classification
+    # Log any prefixes that still need classification
 
     if missing:
 
-        print("\nPrefixes awaiting classification:\n")
+        logger.info("Prefixes awaiting classification:")
 
         for prefix, discovered_at in missing:
-            print(f"  • {prefix}   ({discovered_at})")
+            logger.info("  - %s   (%s)", prefix, discovered_at)
 
     else:
-        print("\n✓ All prefixes are classified.")
+        logger.info("All prefixes are classified.")
+
+    return processed_files
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
     refresh()
