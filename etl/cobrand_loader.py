@@ -116,6 +116,14 @@ def refresh():
 
     con = duckdb.connect(DB)
 
+    try:
+        return _run_refresh(con)
+    finally:
+        con.close()
+
+
+def _run_refresh(con):
+
     parser = TraceParser()
 
     print("Connected to DuckDB.")
@@ -157,6 +165,7 @@ def refresh():
     print(f"Found {len(files)} Cobrand log file(s)")
 
     new_files = 0
+    processed_files = []
 
     for file in files:
 
@@ -166,27 +175,37 @@ def refresh():
 
             print(f"✓ {filename} (already imported)")
 
+            # Already in the warehouse from a prior run. Still eligible
+            # for archiving if the .log file is still sitting on disk
+            # (mirrors the same handling in api_loader.py).
+            processed_files.append(file)
+
             continue
 
         print(f"→ Importing {filename}")
 
-        con.execute(f"""
+        try:
+            con.execute(f"""
 
-        INSERT INTO cobrand_raw_logs
+            INSERT INTO cobrand_raw_logs
 
-        SELECT
+            SELECT
 
-            '{filename}',
+                '{filename}',
 
-            "trace.method"
+                "trace.method"
 
-        FROM read_json_auto('{file}')
+            FROM read_json_auto('{file}')
 
-        WHERE "trace.method" IS NOT NULL
+            WHERE "trace.method" IS NOT NULL
 
-        """)
+            """)
+        except Exception as ex:
+            print(f"✗ Failed to import {filename}: {ex}")
+            continue
 
         new_files += 1
+        processed_files.append(file)
 
     print()
 
@@ -210,6 +229,26 @@ def refresh():
     """).fetchdf()
 
     print(f"Found {len(df)} traces")
+
+    # read_json_auto raises IOException if the glob matches zero files
+    # (rather than returning an empty result) — guard against that.
+    # This is expected once the pipeline has successfully archived and
+    # deleted every Cobrand .log currently on disk.
+    if files:
+        event_df = con.execute("""
+
+        SELECT *
+
+        FROM read_json_auto('logs/cobrand/*.log')
+
+        WHERE "trace.method" IS NULL
+
+        """).fetchdf()
+    else:
+        print("No Cobrand .log files on disk — skipping event preview.")
+        event_df = pd.DataFrame()
+
+    print(event_df.head(20))
 
     all_rows = []
 
@@ -495,6 +534,119 @@ def refresh():
 
     print(f"✓ span_fact built ({rows:,} spans)")
 
+    print("\nBuilding cobrand_event_fact...")
+
+    # read_json_auto raises IOException on a glob that matches zero
+    # files, so we must check first. But it's not enough to just fall
+    # back to an empty DataFrame here: cobrand_event_fact is rebuilt
+    # from *whatever .log files currently exist on disk*, every run
+    # (CREATE OR REPLACE). With zero files on disk, an empty-DataFrame
+    # fallback would recreate the table with zero rows — silently
+    # deleting event data for every file that was already correctly
+    # processed and had its .log removed in a prior run. So when there
+    # are no files to process, skip the rebuild entirely and leave the
+    # existing table untouched.
+    if files:
+
+        event_df = con.execute("""
+
+        SELECT *
+
+        FROM read_json_auto('logs/cobrand/*.log', filename=true)
+
+        WHERE "trace.method" IS NULL
+
+        """).fetchdf()
+
+        event_rows = []
+
+        for _, row in event_df.iterrows():
+
+            event_rows.append({
+
+                "source": "cobrand",
+
+                "source_file": os.path.basename(row["filename"]) if row.get("filename") else None,
+
+                "event_time": row.get("timestamp"),
+
+                "level": row.get("level"),
+
+                "event_action": row.get("event.action"),
+
+                "method_name": row.get("method.name"),
+
+                "message": row.get("message"),
+
+                "result_status": row.get("result.status"),
+
+                "error_message": row.get("error.message"),
+
+                "error_stack": row.get("error.stack"),
+
+                "request_id": row.get("request.id"),
+
+                "user_id": row.get("user.id"),
+
+                "user_tracking_id": row.get("user_tracking.id"),
+
+                "content_id": row.get("content.id"),
+
+                "raw_event": json.dumps(row.to_dict(), default=str)
+
+            })
+
+        event_fact = pd.DataFrame(event_rows)
+
+        con.register("event_fact_df", event_fact)
+
+        con.execute("""
+
+        CREATE OR REPLACE TABLE cobrand_event_fact AS
+
+        SELECT *
+
+        FROM event_fact_df
+
+        """)
+
+        print(f"✓ cobrand_event_fact built ({len(event_fact)} events)")
+
+    else:
+
+        # Make sure the table exists even on a fresh database where no
+        # Cobrand file has ever been processed, so downstream queries
+        # (e.g. Validator.cobrand_row_count) don't fail with a
+        # "table not found" error.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS cobrand_event_fact (
+                source VARCHAR,
+                source_file VARCHAR,
+                event_time VARCHAR,
+                level VARCHAR,
+                event_action VARCHAR,
+                method_name VARCHAR,
+                message VARCHAR,
+                result_status VARCHAR,
+                error_message VARCHAR,
+                error_stack VARCHAR,
+                request_id VARCHAR,
+                user_id VARCHAR,
+                user_tracking_id VARCHAR,
+                content_id VARCHAR,
+                raw_event VARCHAR
+            )
+        """)
+
+        existing_events = con.execute(
+            "SELECT COUNT(*) FROM cobrand_event_fact"
+        ).fetchone()[0]
+
+        print(
+            f"No Cobrand .log files on disk — leaving cobrand_event_fact "
+            f"as-is ({existing_events:,} events from prior runs)"
+        )
+
     context_df = final_df[[
         "span_id",
         "attributes",
@@ -659,6 +811,8 @@ def refresh():
         for row in missing:
 
             print(f" • {row[0]}")
+
+    return processed_files
 
 
 if __name__ == "__main__":
