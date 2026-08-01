@@ -5,8 +5,165 @@ import os
 import pandas as pd
 
 from parsers.parser import TraceParser
+from etl.instrumentation_gap import (
+    sync_instrumentation_gap_catalog,
+    print_instrumentation_backlog,
+)
 
 DB = "finpedia_logs.db"
+
+# Cobrand's event_time format is subtly different from the API side's:
+# "Tue, 21 Jul 2026, 00:00:47 pm" — note the comma before the time
+# AND lowercase am/pm (DuckDB's %p is case-insensitive, verified
+# directly, so no special handling needed for the case difference).
+# Same defensive fallback as api_loader.py's CAPABILITY_TIMESTAMP_SQL:
+# try the strict 12-hour+%p parse first (returns NULL for genuinely
+# out-of-range hours rather than a silently wrong result — verified),
+# then fall back to stripping AM/PM and parsing as raw 24-hour for
+# whatever that strict parse rejects.
+_COBRAND_TIMESTAMP_FORMAT_12H = "%a, %d %b %Y, %H:%M:%S %p"
+_COBRAND_TIMESTAMP_FORMAT_24H = "%a, %d %b %Y, %H:%M:%S"
+
+COBRAND_TIMESTAMP_SQL = rf"""
+    COALESCE(
+        TRY_STRPTIME(event_time, '{_COBRAND_TIMESTAMP_FORMAT_12H}'),
+        TRY_STRPTIME(
+            regexp_replace(event_time, '\s*(AM|PM)$', '', 'i'),
+            '{_COBRAND_TIMESTAMP_FORMAT_24H}'
+        )
+    )
+"""
+
+
+def _parse_cobrand_line(line: str):
+    """
+    Parse one raw line of a Cobrand log file.
+
+    Returns
+    -------
+    dict | None
+        The parsed JSON object, or None if the line is empty or not
+        valid JSON (the caller is responsible for logging/counting
+        that as a skip — this function just reports the outcome).
+    """
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        return json.loads(line)
+    except json.JSONDecodeError:
+        return None
+
+
+def _import_cobrand_file(con, log_file: str, filename: str):
+    """
+    Import the trace-bearing lines of one Cobrand log file into
+    cobrand_raw_logs, parsing each line directly in Python rather than
+    handing the file to DuckDB's read_json_auto().
+
+    DuckDB's JSON reader has its own internal limits/quirks around
+    large, deeply-nested single-line JSON that Python's own json
+    module doesn't share — application-2026-07-20.log (line 403) and
+    application-2026-07-21.log (line 10) both parse cleanly with
+    json.loads(), yet DuckDB's read_json_auto() rejected both as
+    "Malformed JSON". Parsing in Python sidesteps that class of
+    failure entirely, and means one bad line is skipped and logged
+    individually instead of aborting the whole file.
+
+    Returns
+    -------
+    (int, int)
+        (rows inserted, lines skipped as invalid JSON)
+    """
+    rows = []
+    skipped = 0
+
+    with open(log_file, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+
+            record = _parse_cobrand_line(line)
+
+            if record is None:
+                if line.strip():
+                    print(f"    ⚠ {filename} line {line_no}: skipping invalid JSON")
+                    skipped += 1
+                continue
+
+            trace = record.get("trace.method")
+            if trace is None:
+                continue  # standalone event line, not a trace — handled separately
+
+            rows.append((filename, json.dumps(trace)))
+
+    if rows:
+        con.executemany(
+            "INSERT INTO cobrand_raw_logs SELECT ?, json(?)",
+            rows,
+        )
+
+    if skipped:
+        print(f"    ⚠ {filename}: skipped {skipped} malformed line(s)")
+
+    return len(rows), skipped
+
+
+def _read_non_trace_events(files):
+    """
+    Read all standalone-event ("trace.method" absent) rows across a
+    specific list of files, parsing each line directly in Python
+    rather than handing the file to DuckDB's read_json_auto() — same
+    reasoning as _import_cobrand_file() above. One malformed line, or
+    even one entirely unreadable file, no longer aborts extraction for
+    every other file.
+
+    Returns
+    -------
+    (pandas.DataFrame, int)
+        The concatenated event rows from every file that could be
+        opened (empty DataFrame if none), and how many files were
+        successfully opened and scanned (as opposed to files that
+        couldn't be opened at all — e.g. deleted mid-run). Individual
+        malformed lines are skipped and logged, but don't count
+        against a file here, since DuckDB previously failed entire
+        FILES over single bad LINES — that distinction no longer
+        applies now that we parse line-by-line ourselves.
+    """
+    all_rows = []
+    success_count = 0
+
+    for file in files:
+
+        filename = os.path.basename(file)
+
+        try:
+            with open(file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError as ex:
+            print(f"✗ Could not open {filename} for event extraction: {ex}")
+            continue
+
+        success_count += 1
+
+        for line_no, line in enumerate(lines, start=1):
+
+            record = _parse_cobrand_line(line)
+
+            if record is None:
+                if line.strip():
+                    print(f"    ⚠ {filename} line {line_no}: skipping invalid JSON")
+                continue
+
+            if record.get("trace.method") is not None:
+                continue  # trace-bearing line, handled in cobrand_raw_logs
+
+            record["filename"] = filename
+            all_rows.append(record)
+
+    if all_rows:
+        return pd.DataFrame(all_rows), success_count
+
+    return pd.DataFrame(), success_count
+
 
 FIELD_MAP = {
 
@@ -185,24 +342,12 @@ def _run_refresh(con):
         print(f"→ Importing {filename}")
 
         try:
-            con.execute(f"""
-
-            INSERT INTO cobrand_raw_logs
-
-            SELECT
-
-                '{filename}',
-
-                "trace.method"
-
-            FROM read_json_auto('{file}')
-
-            WHERE "trace.method" IS NOT NULL
-
-            """)
-        except Exception as ex:
+            imported_rows, _skipped = _import_cobrand_file(con, file, filename)
+        except OSError as ex:
             print(f"✗ Failed to import {filename}: {ex}")
             continue
+
+        print(f"  inserted {imported_rows} trace row(s)")
 
         new_files += 1
         processed_files.append(file)
@@ -230,23 +375,13 @@ def _run_refresh(con):
 
     print(f"Found {len(df)} traces")
 
-    # read_json_auto raises IOException if the glob matches zero files
-    # (rather than returning an empty result) — guard against that.
-    # This is expected once the pipeline has successfully archived and
-    # deleted every Cobrand .log currently on disk.
-    if files:
-        event_df = con.execute("""
+    # Read per-file rather than via a wildcard glob, so a malformed
+    # file (e.g. application-2026-07-20.log) can't abort the whole
+    # preview — it just gets skipped and logged individually.
+    event_df, _ = _read_non_trace_events(files)
 
-        SELECT *
-
-        FROM read_json_auto('logs/cobrand/*.log')
-
-        WHERE "trace.method" IS NULL
-
-        """).fetchdf()
-    else:
-        print("No Cobrand .log files on disk — skipping event preview.")
-        event_df = pd.DataFrame()
+    if event_df.empty:
+        print("No event rows found for preview (no files, or none parsed).")
 
     print(event_df.head(20))
 
@@ -536,27 +671,89 @@ def _run_refresh(con):
 
     print("\nBuilding cobrand_event_fact...")
 
-    # read_json_auto raises IOException on a glob that matches zero
-    # files, so we must check first. But it's not enough to just fall
-    # back to an empty DataFrame here: cobrand_event_fact is rebuilt
-    # from *whatever .log files currently exist on disk*, every run
-    # (CREATE OR REPLACE). With zero files on disk, an empty-DataFrame
-    # fallback would recreate the table with zero rows — silently
-    # deleting event data for every file that was already correctly
-    # processed and had its .log removed in a prior run. So when there
-    # are no files to process, skip the rebuild entirely and leave the
-    # existing table untouched.
-    if files:
+    # Read per-file (see _read_non_trace_events) rather than via a
+    # single wildcard glob. cobrand_event_fact is rebuilt from whatever
+    # is currently readable on disk (CREATE OR REPLACE), so we only
+    # skip the rebuild in the genuinely dangerous case — nothing at
+    # all could be read, whether because there are zero files or every
+    # file failed to parse. Recreating the table from an empty result
+    # in that case would silently wipe out event data for files that
+    # were already correctly processed and deleted in a prior run.
+    # If SOME files parse fine and others don't (the common case — a
+    # couple of malformed files mixed in with many good ones), we
+    # rebuild using just the good ones; the malformed files simply
+    # don't contribute events until they're fixed and reprocessed.
+    event_df, success_count = _read_non_trace_events(files)
 
-        event_df = con.execute("""
+    if files and success_count == 0:
 
-        SELECT *
+        print(
+            f"✗ All {len(files)} Cobrand file(s) failed to parse for "
+            f"event extraction — leaving cobrand_event_fact untouched "
+            f"rather than rebuilding it from nothing."
+        )
 
-        FROM read_json_auto('logs/cobrand/*.log', filename=true)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS cobrand_event_fact (
+                source VARCHAR,
+                source_file VARCHAR,
+                event_time VARCHAR,
+                level VARCHAR,
+                event_action VARCHAR,
+                method_name VARCHAR,
+                message VARCHAR,
+                result_status VARCHAR,
+                error_message VARCHAR,
+                error_stack VARCHAR,
+                request_id VARCHAR,
+                user_id VARCHAR,
+                user_tracking_id VARCHAR,
+                content_id VARCHAR,
+                raw_event VARCHAR
+            )
+        """)
 
-        WHERE "trace.method" IS NULL
+        existing_events = con.execute(
+            "SELECT COUNT(*) FROM cobrand_event_fact"
+        ).fetchone()[0]
 
-        """).fetchdf()
+        print(f"  cobrand_event_fact unchanged ({existing_events:,} events)")
+
+    elif not files:
+
+        # No Cobrand .log files at all (e.g. everything was
+        # successfully archived + deleted last run). Same reasoning:
+        # don't rebuild from nothing.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS cobrand_event_fact (
+                source VARCHAR,
+                source_file VARCHAR,
+                event_time VARCHAR,
+                level VARCHAR,
+                event_action VARCHAR,
+                method_name VARCHAR,
+                message VARCHAR,
+                result_status VARCHAR,
+                error_message VARCHAR,
+                error_stack VARCHAR,
+                request_id VARCHAR,
+                user_id VARCHAR,
+                user_tracking_id VARCHAR,
+                content_id VARCHAR,
+                raw_event VARCHAR
+            )
+        """)
+
+        existing_events = con.execute(
+            "SELECT COUNT(*) FROM cobrand_event_fact"
+        ).fetchone()[0]
+
+        print(
+            f"No Cobrand .log files on disk — leaving cobrand_event_fact "
+            f"as-is ({existing_events:,} events from prior runs)"
+        )
+
+    else:
 
         event_rows = []
 
@@ -612,40 +809,29 @@ def _run_refresh(con):
 
         print(f"✓ cobrand_event_fact built ({len(event_fact)} events)")
 
-    else:
+    print("\nSynchronizing instrumentation_gap_catalog (COBRAND)...")
 
-        # Make sure the table exists even on a fresh database where no
-        # Cobrand file has ever been processed, so downstream queries
-        # (e.g. Validator.cobrand_row_count) don't fail with a
-        # "table not found" error.
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS cobrand_event_fact (
-                source VARCHAR,
-                source_file VARCHAR,
-                event_time VARCHAR,
-                level VARCHAR,
-                event_action VARCHAR,
-                method_name VARCHAR,
-                message VARCHAR,
-                result_status VARCHAR,
-                error_message VARCHAR,
-                error_stack VARCHAR,
-                request_id VARCHAR,
-                user_id VARCHAR,
-                user_tracking_id VARCHAR,
-                content_id VARCHAR,
-                raw_event VARCHAR
-            )
-        """)
+    # service_name isn't a direct column on cobrand_event_fact, but the
+    # original raw JSON line (preserved in full in raw_event) always
+    # has a "service.name" key — extracted here rather than adding a
+    # new dedicated column, since raw_event already carries it.
+    cobrand_gap_source_sql = f"""
+        SELECT
+            message,
+            COALESCE(json_extract_string(raw_event, '$."service.name"'), 'cobrand') AS service_name,
+            level AS log_level,
+            {COBRAND_TIMESTAMP_SQL} AS parsed_event_time
+        FROM cobrand_event_fact
+        WHERE event_action IS NULL
+          AND message IS NOT NULL
+    """
 
-        existing_events = con.execute(
-            "SELECT COUNT(*) FROM cobrand_event_fact"
-        ).fetchone()[0]
+    gap_total, gap_pending = sync_instrumentation_gap_catalog(con, "COBRAND", cobrand_gap_source_sql)
 
-        print(
-            f"No Cobrand .log files on disk — leaving cobrand_event_fact "
-            f"as-is ({existing_events:,} events from prior runs)"
-        )
+    print(
+        f"✓ instrumentation_gap_catalog synchronized "
+        f"({gap_total} pattern(s), {len(gap_pending)} pending)"
+    )
 
     context_df = final_df[[
         "span_id",
@@ -811,6 +997,9 @@ def _run_refresh(con):
         for row in missing:
 
             print(f" • {row[0]}")
+
+    print()
+    print_instrumentation_backlog(gap_pending, "COBRAND")
 
     return processed_files
 
