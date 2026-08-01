@@ -36,7 +36,9 @@ finpedia-log-system/
 │   ├── validator.py             # Verifies JSON / warehouse / Parquet row counts match
 │   ├── manifest.py              # Records every file's lifecycle in archive_manifest
 │   ├── file_ops.py              # The one place a log file is ever deleted
-│   └── config.py                # AUTO_DELETE_JSON and other pipeline settings
+│   ├── config.py                # AUTO_DELETE_JSON and other pipeline settings
+│   ├── instrumentation_gap.py   # Discovers recurring unstructured log messages
+│   └── signature_rules.py       # Hand-maintained failure-signature label mapping
 │
 ├── parsers/
 │   └── parser.py                # Parses raw Cobrand trace data
@@ -90,7 +92,8 @@ Contains the ETL pipeline. Each module has exactly one responsibility, and
 - creates/updates `raw_logs_api`
 - builds `event_fact_api`
 - updates `event_catalog_api`
-- synchronizes `capability_catalog`
+- synchronizes `capability_catalog` (the Event Registry — see below)
+- synchronizes `instrumentation_gap_catalog` for API-sourced messages
 - returns the list of files successfully processed, for the archiver
 
 **`cobrand_loader.py`**
@@ -101,6 +104,7 @@ Contains the ETL pipeline. Each module has exactly one responsibility, and
 - creates `span_context`
 - synchronizes `dim_span`
 - builds `cobrand_event_fact` (rebuilt from whatever `.log` files currently exist on disk — see note below)
+- synchronizes `instrumentation_gap_catalog` for Cobrand-sourced messages
 - returns the list of files successfully processed, for the archiver
 
 **`archive.py`**
@@ -125,6 +129,14 @@ Contains the ETL pipeline. Each module has exactly one responsibility, and
   ```
   AUTO_DELETE_JSON=false python3 refresh_logs.py
   ```
+
+**`instrumentation_gap.py`**
+- shared by both loaders — discovers recurring log messages that have **no** structured `event_action`, normalizes them into a grouping key (`raw_pattern`), and maintains `instrumentation_gap_catalog`
+- resolves each `raw_pattern` to a short canonical `signature` via `signature_rules.py`
+- see the **Event Registry & Instrumentation Gap Catalog** section below for the full picture
+
+**`signature_rules.py`**
+- a small, hand-maintained list mapping known recurring message patterns to short signature labels (e.g. `FFPROBE_INVALID_MEDIA`, `TWITTER_TOKEN_INVALID`) — deliberately just a flat list, not a rule engine. Add one entry whenever a new recurring, understood failure shows up in the pending backlog; nothing else needs to change
 
 ### `parsers/`
 
@@ -195,9 +207,38 @@ Streamlit Dashboard
 **`event_catalog_api`** — unique event actions, used for capability
 classification.
 
-**`capability_catalog`** — business capability mapping.
+**`capability_catalog`** — the **Event Registry**: one row per event prefix
+(the token before the first dot in `event_action`, e.g. `posting_job.*` →
+`posting_job`), automatically discovered and enriched every run.
 
-Example: `posting_job.*` → `Posting`
+The philosophy: *the ETL discovers events and maintains operational
+metadata; humans classify.* The ETL never overwrites a human's
+classification.
+
+| column | owner | notes |
+|---|---|---|
+| `event_prefix` | ETL | primary key |
+| `capability` / `subsystem` / `description` | **human** | never touched by the ETL |
+| `classification_status` | **human** | `Pending` → `Classified` / `Deprecated` / `Ignored`. Self-heals to `Pending` if ever `NULL` (e.g. after a schema migration), so a row can never silently vanish from the "needs review" list |
+| `first_seen` | ETL | self-corrects via `LEAST(existing, new)` — a backfilled older log file will move this earlier automatically |
+| `last_seen` / `event_count` | ETL | recomputed fresh every run from `event_fact_api`, not incremented |
+| `sample_event` / `sample_service` | ETL | tied to the *most recent* occurrence of that prefix (via `ARG_MAX` on event time), not an arbitrary row |
+
+Query the classification backlog, sorted by volume so the highest-impact
+prefixes surface first:
+```sql
+SELECT event_prefix, event_count, last_seen, sample_event
+FROM capability_catalog
+WHERE classification_status = 'Pending'
+ORDER BY event_count DESC;
+```
+
+Note: `event_time` throughout the API warehouse is stored as text in a
+non-ISO format (`"Sun, 12 Jul 2026 00:00:04 AM"`), and real data mixes in
+a second, self-contradictory variant (24-hour values with a spurious AM/PM
+suffix, e.g. `"18:13:04 PM"` — a bug in whatever service emits these logs).
+Every timestamp comparison in this warehouse parses through a `COALESCE`
+of both formats rather than trusting one.
 
 ### Cobrand Warehouse
 
@@ -233,6 +274,64 @@ If a file's `.log` has already been archived and deleted, its rows stay in
 recreating the table from an empty result when no files are present), but
 this table should not be treated as an independent source of truth the way
 `raw_logs_api` or `cobrand_raw_logs` can be.
+
+### Instrumentation Gap Catalog
+
+While the Event Registry tracks **structured** events (ones with a real
+`event_action`), most log lines aren't structured at all — free-text
+messages like `"Twitter token refresh failed"` or a raw Node.js stack
+trace. `instrumentation_gap_catalog` is the companion catalog for exactly
+those: recurring unstructured messages that don't yet have a proper
+`event_action`, but probably should.
+
+```
+Raw message
+  ↓
+Noise filter        (drops framework/transport noise — "HTTP REQUEST"
+                      alone was 98% of one real sample; without this
+                      filter the catalog is unusable)
+  ↓
+First line only      (a multi-line stack trace is never used as the
+                      grouping key — only its first line is; the full
+                      trace is still preserved, in example_message)
+  ↓
+Normalize            (strip ISO timestamps → {timestamp}, UUIDs → {uuid},
+                      hex addresses → {hex}, remaining digits → {n})
+  ↓
+raw_pattern           (the grouping key)
+  ↓
+signature             (a short canonical label, via signature_rules.py —
+                       defaults to raw_pattern itself if no rule matches)
+  ↓
+instrumentation_gap_catalog
+```
+
+Populated from **both** warehouses — `event_fact_api` (API) and
+`cobrand_event_fact` (Cobrand) — via the same shared logic in
+`instrumentation_gap.py`, so the noise filter and normalization rules
+exist in exactly one place rather than being duplicated per loader.
+
+| column | owner | notes |
+|---|---|---|
+| `raw_pattern` / `source_system` | ETL | composite primary key. `source_system` (`API`/`COBRAND`) is part of the key, not just a label — otherwise syncing both sources into one table risks one silently overwriting the other's row for an identical pattern |
+| `signature` | ETL | resolved via `signature_rules.py`, **re-resolved and overwritten every run** — adding a new rule retroactively relabels an already-catalogued pattern next time it syncs, no manual migration needed |
+| `classification_status` / `probable_component` / `recommended_event_action` / `notes` | **human** | never touched by the ETL (same self-healing-to-`Pending` behavior as the Event Registry) |
+| `occurrence_count` / `first_seen` / `last_seen` / `example_message` / `service_name` / `log_level` | ETL | recomputed fresh every run; `example_message` always holds the full original text (including any stack trace) even though `raw_pattern` is based on just the first line |
+
+Example workflow: once a recurring pattern is understood, add a rule to
+`signature_rules.py`:
+```python
+{"pattern": r"ffprobe exited", "signature": "FFPROBE_INVALID_MEDIA"},
+```
+No other code changes — the next sync relabels every matching row
+automatically. To go further and record what the failure actually *means*
+for a specific row, use the human-owned columns directly:
+```sql
+UPDATE instrumentation_gap_catalog
+SET recommended_event_action = 'video.validation.max_fps_failed',
+    probable_component = 'Cobrand Video Generator'
+WHERE raw_pattern LIKE '%Max FPS found from the video files%';
+```
 
 ### Archive & Audit Layer
 
@@ -294,7 +393,9 @@ event_fact_api
   ↓
 event_catalog_api
   ↓
-capability_catalog
+capability_catalog (Event Registry)
+  ↓
+instrumentation_gap_catalog
   ↓
 Parquet Archive + archive_manifest
 ```
@@ -313,6 +414,8 @@ span_fact
 span_context
   ↓
 dim_span
+  ↓
+instrumentation_gap_catalog
   ↓
 Parquet Archive + archive_manifest
 ```
