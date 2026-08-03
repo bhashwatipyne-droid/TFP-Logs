@@ -67,17 +67,17 @@ class TraceParser:
 
         self.rows = []
 
-    def parse(self, trace):
+    def parse(self, trace, trace_timestamp=None):
 
         self.rows = []
 
         trace_id = str(uuid.uuid4())
 
-        self._walk(trace, trace_id)
+        self._walk(trace, trace_id, trace_timestamp=trace_timestamp)
 
         return self.rows
 
-    def _walk(self, node, trace_id, parent=None, depth=0):
+    def _walk(self, node, trace_id, parent=None, depth=0, trace_timestamp=None):
 
         span = Span()
 
@@ -92,7 +92,20 @@ class TraceParser:
 
         span.method_name = node.get("method.name")
 
-        span.event_time = node.get("timestamp")
+        # A node's own "timestamp" key has never been observed in real
+        # data (confirmed directly: 0 of 8,836 span_fact rows had one)
+        # — only the outer log line, one level above trace.method,
+        # carries a timestamp for the whole trace. node.get("timestamp")
+        # is kept as the first choice in case that ever changes upstream
+        # (e.g. a future app version starts stamping individual spans),
+        # falling back to the trace-wide timestamp passed down from the
+        # root otherwise. This means every span in a trace currently
+        # shares one timestamp (the trace's start time), not a precise
+        # per-span time — an approximation, not a data loss to hide.
+        span.event_time = first(
+            node.get("timestamp"),
+            trace_timestamp,
+        )
 
         span.duration_ms = node.get("event.duration_ms")
 
@@ -106,9 +119,36 @@ class TraceParser:
 
         span.result_status = result.get("result.status")
 
-        span.error_message = error.get("error.message")
+        # BUG FIX: this used to read error.get("error.message") /
+        # error.get("error.stack") — but the "error" object's actual
+        # keys are "message" and "stack" (e.g. "error":{"message":
+        # "ffprobe exited...","stack":"Error: ffprobe exited..."}).
+        # error.get("error.message") can never succeed against that
+        # shape, since no such key exists — this was silently
+        # discarding every single error/stack trace in the warehouse
+        # (confirmed directly: 0 non-null error_message across every
+        # row, regardless of event_action).
+        #
+        # Separately, this application is inconsistent about *where*
+        # it puts error info: some spans carry a genuine "error"
+        # object (e.g. cobrand.pdf.generate), while others have no
+        # "error" key at all but instead carry a flattened copy as
+        # literal dotted keys directly inside "details" (e.g.
+        # cobrand.job.process's details containing "error.message"/
+        # "error.stack" keys). first() checks all three shapes in
+        # order, so whichever one a given span actually uses, the
+        # error still gets captured.
+        span.error_message = first(
+            error.get("message"),
+            error.get("error.message"),
+            details.get("error.message"),
+        )
 
-        span.error_stack = error.get("error.stack")
+        span.error_stack = first(
+            error.get("stack"),
+            error.get("error.stack"),
+            details.get("error.stack"),
+        )
 
         span.attributes = attributes
 
@@ -144,7 +184,8 @@ class TraceParser:
                 child,
                 trace_id,
                 parent=span,
-                depth=depth + 1
+                depth=depth + 1,
+                trace_timestamp=trace_timestamp
             )
 
     def to_dataframe(self):
