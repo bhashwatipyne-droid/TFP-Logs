@@ -775,4 +775,330 @@ def _run_refresh(con):
     # skip the rebuild in the genuinely dangerous case — nothing at
     # all could be read, whether because there are zero files or every
     # file failed to parse. Recreating the table from an empty result
-    # in that case would silently wipe out e
+    # in that case would silently wipe out event data for files that
+    # were already correctly processed and deleted in a prior run.
+    # If SOME files parse fine and others don't (the common case — a
+    # couple of malformed files mixed in with many good ones), we
+    # rebuild using just the good ones; the malformed files simply
+    # don't contribute events until they're fixed and reprocessed.
+    event_df, success_count = _read_non_trace_events(files)
+
+    if files and success_count == 0:
+
+        print(
+            f"✗ All {len(files)} Cobrand file(s) failed to parse for "
+            f"event extraction — leaving cobrand_event_fact untouched "
+            f"rather than rebuilding it from nothing."
+        )
+
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS cobrand_event_fact (
+                source VARCHAR,
+                source_file VARCHAR,
+                event_time VARCHAR,
+                level VARCHAR,
+                event_action VARCHAR,
+                method_name VARCHAR,
+                message VARCHAR,
+                result_status VARCHAR,
+                error_message VARCHAR,
+                error_stack VARCHAR,
+                request_id VARCHAR,
+                user_id VARCHAR,
+                user_tracking_id VARCHAR,
+                content_id VARCHAR,
+                raw_event VARCHAR
+            )
+        """)
+
+        existing_events = con.execute(
+            "SELECT COUNT(*) FROM cobrand_event_fact"
+        ).fetchone()[0]
+
+        print(f"  cobrand_event_fact unchanged ({existing_events:,} events)")
+
+    elif not files:
+
+        # No Cobrand .log files at all (e.g. everything was
+        # successfully archived + deleted last run). Same reasoning:
+        # don't rebuild from nothing.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS cobrand_event_fact (
+                source VARCHAR,
+                source_file VARCHAR,
+                event_time VARCHAR,
+                level VARCHAR,
+                event_action VARCHAR,
+                method_name VARCHAR,
+                message VARCHAR,
+                result_status VARCHAR,
+                error_message VARCHAR,
+                error_stack VARCHAR,
+                request_id VARCHAR,
+                user_id VARCHAR,
+                user_tracking_id VARCHAR,
+                content_id VARCHAR,
+                raw_event VARCHAR
+            )
+        """)
+
+        existing_events = con.execute(
+            "SELECT COUNT(*) FROM cobrand_event_fact"
+        ).fetchone()[0]
+
+        print(
+            f"No Cobrand .log files on disk — leaving cobrand_event_fact "
+            f"as-is ({existing_events:,} events from prior runs)"
+        )
+
+    else:
+
+        event_rows = []
+
+        for _, row in event_df.iterrows():
+
+            event_rows.append({
+
+                "source": "cobrand",
+
+                "source_file": os.path.basename(row["filename"]) if row.get("filename") else None,
+
+                "event_time": row.get("timestamp"),
+
+                "level": row.get("level"),
+
+                "event_action": row.get("event.action"),
+
+                "method_name": row.get("method.name"),
+
+                "message": row.get("message"),
+
+                "result_status": row.get("result.status"),
+
+                "error_message": row.get("error.message"),
+
+                "error_stack": row.get("error.stack"),
+
+                "request_id": row.get("request.id"),
+
+                "user_id": row.get("user.id"),
+
+                "user_tracking_id": row.get("user_tracking.id"),
+
+                "content_id": row.get("content.id"),
+
+                "raw_event": json.dumps(row.to_dict(), default=str)
+
+            })
+
+        event_fact = pd.DataFrame(event_rows)
+
+        con.register("event_fact_df", event_fact)
+
+        con.execute("""
+
+        CREATE OR REPLACE TABLE cobrand_event_fact AS
+
+        SELECT *
+
+        FROM event_fact_df
+
+        """)
+
+        print(f"✓ cobrand_event_fact built ({len(event_fact)} events)")
+
+    print("\nSynchronizing instrumentation_gap_catalog (COBRAND)...")
+
+    # service_name isn't a direct column on cobrand_event_fact, but the
+    # original raw JSON line (preserved in full in raw_event) always
+    # has a "service.name" key — extracted here rather than adding a
+    # new dedicated column, since raw_event already carries it.
+    cobrand_gap_source_sql = f"""
+        SELECT
+            message,
+            COALESCE(json_extract_string(raw_event, '$."service.name"'), 'cobrand') AS service_name,
+            level AS log_level,
+            {COBRAND_TIMESTAMP_SQL} AS parsed_event_time
+        FROM cobrand_event_fact
+        WHERE event_action IS NULL
+          AND message IS NOT NULL
+    """
+
+    gap_total, gap_pending = sync_instrumentation_gap_catalog(con, "COBRAND", cobrand_gap_source_sql)
+
+    print(
+        f"✓ instrumentation_gap_catalog synchronized "
+        f"({gap_total} pattern(s), {len(gap_pending)} pending)"
+    )
+
+    con.execute("""
+
+    CREATE TABLE IF NOT EXISTS span_context (
+
+        span_id UUID PRIMARY KEY,
+
+        attributes JSON,
+
+        details JSON
+
+    )
+
+    """)
+
+    if not final_df.empty:
+
+        context_df = final_df[[
+            "span_id",
+            "attributes",
+            "details"
+        ]].copy()
+
+        context_df["attributes"] = context_df["attributes"].apply(
+            lambda d: json.dumps(d, default=str)
+        )
+
+        context_df["details"] = context_df["details"].apply(
+            lambda d: json.dumps(d, default=str)
+        )
+
+        con.register(
+            "span_context_df",
+            context_df
+        )
+
+        con.execute("""
+
+        INSERT INTO span_context
+
+        SELECT
+
+            span_id,
+
+            attributes,
+
+            details
+
+        FROM span_context_df
+
+        """)
+
+        con.unregister("span_context_df")
+
+    context_rows = con.execute("""
+
+    SELECT COUNT(*)
+
+    FROM span_context
+
+    """).fetchone()[0]
+
+    print(f"✓ span_context now has {context_rows:,} row(s) total ({len(final_df):,} new this run)")
+
+    print()
+
+    print("Synchronizing dim_span...")
+
+    con.execute("""
+
+    CREATE TABLE IF NOT EXISTS dim_span (
+
+        event_action VARCHAR PRIMARY KEY,
+
+        service_name VARCHAR,
+
+        method_name VARCHAR,
+
+        layer VARCHAR,
+
+        category VARCHAR,
+
+        criticality VARCHAR,
+
+        owner_team VARCHAR,
+
+        remarks VARCHAR,
+
+        discovered_at TIMESTAMP
+
+    )
+
+    """)
+
+    con.execute("""
+
+    INSERT INTO dim_span (
+
+        event_action,
+
+        service_name,
+
+        method_name,
+
+        discovered_at
+
+    )
+
+    SELECT
+
+        event_action,
+
+        source AS service_name,
+
+        method_name,
+
+        CURRENT_TIMESTAMP
+
+    FROM span_fact
+
+    WHERE event_action NOT IN (
+
+        SELECT event_action
+
+        FROM dim_span
+
+    )
+
+    QUALIFY ROW_NUMBER() OVER (
+
+        PARTITION BY event_action
+
+        ORDER BY method_name
+
+    ) = 1
+
+    """)
+
+    missing = con.execute("""
+
+    SELECT
+
+    event_action
+
+    FROM dim_span
+
+    WHERE layer IS NULL
+
+    ORDER BY event_action
+
+    """).fetchall()
+
+    print(f"✓ {len(missing)} span(s) require classification")
+
+    if missing:
+
+        print()
+
+        print("Spans awaiting classification:\n")
+
+        for row in missing:
+
+            print(f" • {row[0]}")
+
+    print()
+    print_instrumentation_backlog(gap_pending, "COBRAND")
+
+    return processed_files
+
+
+if __name__ == "__main__":
+    refresh()
