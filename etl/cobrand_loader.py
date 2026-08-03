@@ -93,11 +93,20 @@ def _import_cobrand_file(con, log_file: str, filename: str):
             if trace is None:
                 continue  # standalone event line, not a trace — handled separately
 
-            rows.append((filename, json.dumps(trace)))
+            # The trace.method sub-object itself never carries a
+            # "timestamp" key anywhere in it (verified directly against
+            # real data: 0 of 8,836 span_fact rows had one). The only
+            # timestamp for this whole trace lives as a SIBLING key on
+            # the outer log line — it was being silently discarded here
+            # every time trace.method got extracted on its own. Captured
+            # now so the parser has something to work with.
+            trace_timestamp = record.get("timestamp")
+
+            rows.append((filename, json.dumps(trace), trace_timestamp))
 
     if rows:
         con.executemany(
-            "INSERT INTO cobrand_raw_logs SELECT ?, json(?)",
+            "INSERT INTO cobrand_raw_logs (source_file, trace, trace_timestamp) SELECT ?, json(?), ?",
             rows,
         )
 
@@ -291,11 +300,42 @@ def _run_refresh(con):
 
         source_file VARCHAR,
 
-        trace JSON
+        trace JSON,
+
+        trace_timestamp VARCHAR
 
     )
 
     """)
+
+    # Migration for a table created before trace_timestamp existed —
+    # ADD COLUMN IF NOT EXISTS is a no-op if it's already there.
+    con.execute(
+        "ALTER TABLE cobrand_raw_logs ADD COLUMN IF NOT EXISTS trace_timestamp VARCHAR"
+    )
+
+    # raw_id: a stable, unique per-row identifier, assigned once at
+    # insert time and never recomputed. This is what makes trace
+    # parsing incremental (see the "Parsing traces" section below) —
+    # without it, every refresh had to re-parse the ENTIRE historical
+    # cobrand_raw_logs table through TraceParser every single run,
+    # regardless of whether anything new came in. At current volume
+    # that's still sub-second, but it's the one part of this pipeline
+    # whose cost scales with TOTAL historical data rather than NEW
+    # data since last run — worth fixing before Cobrand volume grows
+    # into the tens of thousands of lines/day.
+    #
+    # DEFAULT nextval(...) means existing INSERT statements don't need
+    # to change at all — DuckDB assigns each row (existing or new) its
+    # own distinct sequence value automatically, verified directly
+    # (ALTER TABLE ADD COLUMN on 3 existing rows assigned 1, 2, 3; a
+    # subsequent 2-row INSERT correctly continued at 4, 5 — not the
+    # same value repeated for the whole batch).
+    con.execute("CREATE SEQUENCE IF NOT EXISTS cobrand_raw_logs_seq START 1")
+    con.execute(
+        "ALTER TABLE cobrand_raw_logs ADD COLUMN IF NOT EXISTS raw_id "
+        "BIGINT DEFAULT nextval('cobrand_raw_logs_seq')"
+    )
 
     existing_files = {
 
@@ -359,116 +399,41 @@ def _run_refresh(con):
     else:
         print(f"✓ Imported {new_files} new file(s).")
 
-    print("\nParsing traces from cobrand_raw_logs...")
+    # span_fact's schema is created up front (not after parsing) so the
+    # anti-join below has something to check new traces against, even
+    # on a completely fresh database. CREATE TABLE IF NOT EXISTS, not
+    # DROP+CREATE — this table is now built incrementally: existing
+    # spans are never touched, only genuinely new ones get appended.
+    # One-time migration: if span_fact already exists from before
+    # raw_id existed, its rows have no way to be linked back to
+    # cobrand_raw_logs at all — CREATE TABLE IF NOT EXISTS won't
+    # retroactively add a column to an existing table. Left alone,
+    # every historical trace would look "not yet processed" against
+    # an empty/mismatched raw_id, and get re-parsed and duplicated
+    # alongside the existing rows. Since cobrand_raw_logs already has
+    # every historical trace preserved, the safe fix is a one-time
+    # full rebuild of span_fact + span_context here — costs one slower
+    # run, then every run after this is genuinely incremental.
+    span_fact_exists = con.execute("""
+        SELECT COUNT(*) FROM information_schema.tables
+        WHERE table_name = 'span_fact'
+    """).fetchone()[0] > 0
 
-    df = con.execute("""
-
-    SELECT
-
-        source_file,
-
-        trace
-
-    FROM cobrand_raw_logs
-
-    """).fetchdf()
-
-    print(f"Found {len(df)} traces")
-
-    # Read per-file rather than via a wildcard glob, so a malformed
-    # file (e.g. application-2026-07-20.log) can't abort the whole
-    # preview — it just gets skipped and logged individually.
-    event_df, _ = _read_non_trace_events(files)
-
-    if event_df.empty:
-        print("No event rows found for preview (no files, or none parsed).")
-
-    print(event_df.head(20))
-
-    all_rows = []
-
-    for i, row in df.iterrows():
-
-        trace = row["trace"]
-
-        if isinstance(trace, str):
-            trace = json.loads(trace)
-
-        parser.parse(trace)
-
-        for span in parser.rows:
-
-            span.source_file = row["source_file"]
-
-            new_row = {
-
-                "trace_id": span.trace_id,
-
-                "span_id": span.span_id,
-
-                "parent_id": span.parent_id,
-
-                "depth": span.depth,
-
-                "event_time": span.event_time,
-
-                "event_action": span.event_action,
-
-                "method_name": span.method_name,
-
-                "duration_ms": span.duration_ms,
-
-                "result_status": span.result_status,
-
-                "error_message": span.error_message,
-
-                "user_id": span.user_id,
-
-                "user_tracking_id": span.user_tracking_id,
-
-                "content_id": span.content_id,
-
-                "service_name": span.service_name,
-
-                "source": "cobrand",
-
-                "source_file": span.source_file,
-
-                "attributes": span.attributes,
-
-                "details": span.details
-
-            }
-
-            for column, (location, key) in FIELD_MAP.items():
-
-                if location == "details":
-
-                    new_row[column] = span.get_detail(key)
-
-                else:
-
-                    new_row[column] = span.get_attribute(key)
-
-            all_rows.append(new_row)
-
-    final_df = pd.DataFrame(all_rows)
-
-    print()
-
-    print(f"Parsed {len(final_df):,} spans")
-
-    print("Creating span_fact...")
+    if span_fact_exists:
+        existing_span_fact_columns = {
+            row[0] for row in con.execute("DESCRIBE span_fact").fetchall()
+        }
+        if "raw_id" not in existing_span_fact_columns:
+            print(
+                "\nMigrating span_fact to incremental (raw_id-tracked) "
+                "parsing — one-time full rebuild from cobrand_raw_logs..."
+            )
+            con.execute("DROP TABLE IF EXISTS span_fact")
+            con.execute("DROP TABLE IF EXISTS span_context")
 
     con.execute("""
 
-    DROP TABLE IF EXISTS span_fact
-
-    """)
-
-    con.execute("""
-
-    CREATE TABLE span_fact (
+    CREATE TABLE IF NOT EXISTS span_fact (
 
         trace_id UUID,
 
@@ -536,128 +501,261 @@ def _run_refresh(con):
 
         generated_file_size BIGINT,
 
-        file_extension VARCHAR
+        file_extension VARCHAR,
+
+        raw_id BIGINT
 
     )
 
     """)
 
-    con.register(
-        "final_df",
-        final_df
-    )
+    print("\nParsing traces from cobrand_raw_logs...")
 
-    con.execute("""
-
-    INSERT INTO span_fact (
-
-    trace_id,
-    span_id,
-    parent_id,
-    depth,
-
-    source,
-    source_file,
-
-    event_time,
-    request_id,
-
-    event_action,
-    method_name,
-
-    duration_ms,
-
-    result_status,
-
-    error_message,
-    error_stack,
-
-    user_id,
-    user_uuid,
-    user_tracking_id,
-
-    content_id,
-    content_uuid,
-
-    content_variation_id,
-    content_variation_uuid,
-
-    content_type,
-
-    cobrand_job_type,
-    cobrand_status,
-    cobrand_branch,
-
-    queue_pending_before,
-    queue_pending_after,
-    queue_remaining,
-
-    callback_completed,
-    callback_attempt,
-    callback_max_attempts,
-
-    generated_file_exists,
-    generated_file_size,
-
-    file_extension
-
-    )
+    # Only parse raw trace rows that haven't already been turned into
+    # spans — this is the whole point of raw_id. Previously this
+    # SELECT had no WHERE clause at all, meaning every refresh re-fed
+    # the ENTIRE historical cobrand_raw_logs table through TraceParser
+    # (pure Python), regardless of whether anything new came in. That
+    # cost scales with total historical data, not new data since last
+    # run — the anti-join below makes the cost scale with new data
+    # only, same as api_loader.py's existing_files pattern.
+    df = con.execute("""
 
     SELECT
 
-    trace_id,
-    span_id,
-    parent_id,
-    depth,
+        r.source_file,
 
-    source,
-    source_file,
+        r.trace,
 
-    event_time,
-    request_id,
+        r.trace_timestamp,
 
-    event_action,
-    method_name,
+        r.raw_id
 
-    duration_ms,
+    FROM cobrand_raw_logs r
 
-    result_status,
+    WHERE NOT EXISTS (
+        SELECT 1 FROM span_fact sf WHERE sf.raw_id = r.raw_id
+    )
 
-    error_message,
-    error_stack,
+    """).fetchdf()
 
-    user_id,
-    user_uuid,
-    user_tracking_id,
+    already_processed = con.execute(
+        "SELECT COUNT(DISTINCT raw_id) FROM span_fact"
+    ).fetchone()[0]
 
-    content_id,
-    content_uuid,
+    print(f"Found {len(df)} new trace(s) to parse ({already_processed:,} already processed)")
 
-    content_variation_id,
-    content_variation_uuid,
+    # Read per-file rather than via a wildcard glob, so a malformed
+    # file (e.g. application-2026-07-20.log) can't abort the whole
+    # preview — it just gets skipped and logged individually.
+    event_df, _ = _read_non_trace_events(files)
 
-    content_type,
+    if event_df.empty:
+        print("No event rows found for preview (no files, or none parsed).")
 
-    cobrand_job_type,
-    cobrand_status,
-    cobrand_branch,
+    print(event_df.head(20))
 
-    queue_pending_before,
-    queue_pending_after,
-    queue_remaining,
+    all_rows = []
 
-    callback_completed,
-    callback_attempt,
-    callback_max_attempts,
+    for i, row in df.iterrows():
 
-    generated_file_exists,
-    generated_file_size,
+        trace = row["trace"]
 
-    file_extension
+        if isinstance(trace, str):
+            trace = json.loads(trace)
 
-    FROM final_df
+        parser.parse(trace, trace_timestamp=row["trace_timestamp"])
 
-    """)
+        for span in parser.rows:
+
+            span.source_file = row["source_file"]
+
+            new_row = {
+
+                "trace_id": span.trace_id,
+
+                "span_id": span.span_id,
+
+                "parent_id": span.parent_id,
+
+                "depth": span.depth,
+
+                "event_time": span.event_time,
+
+                "event_action": span.event_action,
+
+                "method_name": span.method_name,
+
+                "duration_ms": span.duration_ms,
+
+                "result_status": span.result_status,
+
+                "error_message": span.error_message,
+
+                "user_id": span.user_id,
+
+                "user_tracking_id": span.user_tracking_id,
+
+                "content_id": span.content_id,
+
+                "service_name": span.service_name,
+
+                "source": "cobrand",
+
+                "source_file": span.source_file,
+
+                "attributes": span.attributes,
+
+                "details": span.details,
+
+                "raw_id": row["raw_id"]
+
+            }
+
+            for column, (location, key) in FIELD_MAP.items():
+
+                if location == "details":
+
+                    new_row[column] = span.get_detail(key)
+
+                else:
+
+                    new_row[column] = span.get_attribute(key)
+
+            all_rows.append(new_row)
+
+    final_df = pd.DataFrame(all_rows)
+
+    print()
+
+    print(f"Parsed {len(final_df):,} new span(s)")
+
+    print("Appending to span_fact...")
+
+    if not final_df.empty:
+
+        con.register(
+            "final_df",
+            final_df
+        )
+
+        con.execute("""
+
+        INSERT INTO span_fact (
+
+        trace_id,
+        span_id,
+        parent_id,
+        depth,
+
+        source,
+        source_file,
+
+        event_time,
+        request_id,
+
+        event_action,
+        method_name,
+
+        duration_ms,
+
+        result_status,
+
+        error_message,
+        error_stack,
+
+        user_id,
+        user_uuid,
+        user_tracking_id,
+
+        content_id,
+        content_uuid,
+
+        content_variation_id,
+        content_variation_uuid,
+
+        content_type,
+
+        cobrand_job_type,
+        cobrand_status,
+        cobrand_branch,
+
+        queue_pending_before,
+        queue_pending_after,
+        queue_remaining,
+
+        callback_completed,
+        callback_attempt,
+        callback_max_attempts,
+
+        generated_file_exists,
+        generated_file_size,
+
+        file_extension,
+
+        raw_id
+
+        )
+
+        SELECT
+
+        trace_id,
+        span_id,
+        parent_id,
+        depth,
+
+        source,
+        source_file,
+
+        event_time,
+        request_id,
+
+        event_action,
+        method_name,
+
+        duration_ms,
+
+        result_status,
+
+        error_message,
+        error_stack,
+
+        user_id,
+        user_uuid,
+        user_tracking_id,
+
+        content_id,
+        content_uuid,
+
+        content_variation_id,
+        content_variation_uuid,
+
+        content_type,
+
+        cobrand_job_type,
+        cobrand_status,
+        cobrand_branch,
+
+        queue_pending_before,
+        queue_pending_after,
+        queue_remaining,
+
+        callback_completed,
+        callback_attempt,
+        callback_max_attempts,
+
+        generated_file_exists,
+        generated_file_size,
+
+        file_extension,
+
+        raw_id
+
+        FROM final_df
+
+        """)
+
+        con.unregister("final_df")
 
     rows = con.execute("""
 
@@ -667,7 +765,7 @@ def _run_refresh(con):
 
     """).fetchone()[0]
 
-    print(f"✓ span_fact built ({rows:,} spans)")
+    print(f"✓ span_fact now has {rows:,} span(s) total ({len(final_df):,} new this run)")
 
     print("\nBuilding cobrand_event_fact...")
 
@@ -677,332 +775,4 @@ def _run_refresh(con):
     # skip the rebuild in the genuinely dangerous case — nothing at
     # all could be read, whether because there are zero files or every
     # file failed to parse. Recreating the table from an empty result
-    # in that case would silently wipe out event data for files that
-    # were already correctly processed and deleted in a prior run.
-    # If SOME files parse fine and others don't (the common case — a
-    # couple of malformed files mixed in with many good ones), we
-    # rebuild using just the good ones; the malformed files simply
-    # don't contribute events until they're fixed and reprocessed.
-    event_df, success_count = _read_non_trace_events(files)
-
-    if files and success_count == 0:
-
-        print(
-            f"✗ All {len(files)} Cobrand file(s) failed to parse for "
-            f"event extraction — leaving cobrand_event_fact untouched "
-            f"rather than rebuilding it from nothing."
-        )
-
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS cobrand_event_fact (
-                source VARCHAR,
-                source_file VARCHAR,
-                event_time VARCHAR,
-                level VARCHAR,
-                event_action VARCHAR,
-                method_name VARCHAR,
-                message VARCHAR,
-                result_status VARCHAR,
-                error_message VARCHAR,
-                error_stack VARCHAR,
-                request_id VARCHAR,
-                user_id VARCHAR,
-                user_tracking_id VARCHAR,
-                content_id VARCHAR,
-                raw_event VARCHAR
-            )
-        """)
-
-        existing_events = con.execute(
-            "SELECT COUNT(*) FROM cobrand_event_fact"
-        ).fetchone()[0]
-
-        print(f"  cobrand_event_fact unchanged ({existing_events:,} events)")
-
-    elif not files:
-
-        # No Cobrand .log files at all (e.g. everything was
-        # successfully archived + deleted last run). Same reasoning:
-        # don't rebuild from nothing.
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS cobrand_event_fact (
-                source VARCHAR,
-                source_file VARCHAR,
-                event_time VARCHAR,
-                level VARCHAR,
-                event_action VARCHAR,
-                method_name VARCHAR,
-                message VARCHAR,
-                result_status VARCHAR,
-                error_message VARCHAR,
-                error_stack VARCHAR,
-                request_id VARCHAR,
-                user_id VARCHAR,
-                user_tracking_id VARCHAR,
-                content_id VARCHAR,
-                raw_event VARCHAR
-            )
-        """)
-
-        existing_events = con.execute(
-            "SELECT COUNT(*) FROM cobrand_event_fact"
-        ).fetchone()[0]
-
-        print(
-            f"No Cobrand .log files on disk — leaving cobrand_event_fact "
-            f"as-is ({existing_events:,} events from prior runs)"
-        )
-
-    else:
-
-        event_rows = []
-
-        for _, row in event_df.iterrows():
-
-            event_rows.append({
-
-                "source": "cobrand",
-
-                "source_file": os.path.basename(row["filename"]) if row.get("filename") else None,
-
-                "event_time": row.get("timestamp"),
-
-                "level": row.get("level"),
-
-                "event_action": row.get("event.action"),
-
-                "method_name": row.get("method.name"),
-
-                "message": row.get("message"),
-
-                "result_status": row.get("result.status"),
-
-                "error_message": row.get("error.message"),
-
-                "error_stack": row.get("error.stack"),
-
-                "request_id": row.get("request.id"),
-
-                "user_id": row.get("user.id"),
-
-                "user_tracking_id": row.get("user_tracking.id"),
-
-                "content_id": row.get("content.id"),
-
-                "raw_event": json.dumps(row.to_dict(), default=str)
-
-            })
-
-        event_fact = pd.DataFrame(event_rows)
-
-        con.register("event_fact_df", event_fact)
-
-        con.execute("""
-
-        CREATE OR REPLACE TABLE cobrand_event_fact AS
-
-        SELECT *
-
-        FROM event_fact_df
-
-        """)
-
-        print(f"✓ cobrand_event_fact built ({len(event_fact)} events)")
-
-    print("\nSynchronizing instrumentation_gap_catalog (COBRAND)...")
-
-    # service_name isn't a direct column on cobrand_event_fact, but the
-    # original raw JSON line (preserved in full in raw_event) always
-    # has a "service.name" key — extracted here rather than adding a
-    # new dedicated column, since raw_event already carries it.
-    cobrand_gap_source_sql = f"""
-        SELECT
-            message,
-            COALESCE(json_extract_string(raw_event, '$."service.name"'), 'cobrand') AS service_name,
-            level AS log_level,
-            {COBRAND_TIMESTAMP_SQL} AS parsed_event_time
-        FROM cobrand_event_fact
-        WHERE event_action IS NULL
-          AND message IS NOT NULL
-    """
-
-    gap_total, gap_pending = sync_instrumentation_gap_catalog(con, "COBRAND", cobrand_gap_source_sql)
-
-    print(
-        f"✓ instrumentation_gap_catalog synchronized "
-        f"({gap_total} pattern(s), {len(gap_pending)} pending)"
-    )
-
-    context_df = final_df[[
-        "span_id",
-        "attributes",
-        "details"
-    ]].copy()
-
-    context_df["attributes"] = context_df["attributes"].apply(
-        lambda d: json.dumps(d, default=str)
-    )
-
-    context_df["details"] = context_df["details"].apply(
-        lambda d: json.dumps(d, default=str)
-    )
-
-    con.execute("""
-
-    DROP TABLE IF EXISTS span_context
-
-    """)
-
-    con.execute("""
-
-    CREATE TABLE span_context (
-
-        span_id UUID PRIMARY KEY,
-
-        attributes JSON,
-
-        details JSON
-
-    )
-
-    """)
-
-    con.register(
-        "span_context_df",
-        context_df
-    )
-
-    con.execute("""
-
-    INSERT INTO span_context
-
-    SELECT
-
-        span_id,
-
-        attributes,
-
-        details
-
-    FROM span_context_df
-
-    """)
-
-    context_rows = con.execute("""
-
-    SELECT COUNT(*)
-
-    FROM span_context
-
-    """).fetchone()[0]
-
-    print(f"✓ span_context built ({context_rows:,} rows)")
-
-    print()
-
-    print("Synchronizing dim_span...")
-
-    con.execute("""
-
-    CREATE TABLE IF NOT EXISTS dim_span (
-
-        event_action VARCHAR PRIMARY KEY,
-
-        service_name VARCHAR,
-
-        method_name VARCHAR,
-
-        layer VARCHAR,
-
-        category VARCHAR,
-
-        criticality VARCHAR,
-
-        owner_team VARCHAR,
-
-        remarks VARCHAR,
-
-        discovered_at TIMESTAMP
-
-    )
-
-    """)
-
-    con.execute("""
-
-    INSERT INTO dim_span (
-
-        event_action,
-
-        service_name,
-
-        method_name,
-
-        discovered_at
-
-    )
-
-    SELECT
-
-        event_action,
-
-        source AS service_name,
-
-        method_name,
-
-        CURRENT_TIMESTAMP
-
-    FROM span_fact
-
-    WHERE event_action NOT IN (
-
-        SELECT event_action
-
-        FROM dim_span
-
-    )
-
-    QUALIFY ROW_NUMBER() OVER (
-
-        PARTITION BY event_action
-
-        ORDER BY method_name
-
-    ) = 1
-
-    """)
-
-    missing = con.execute("""
-
-    SELECT
-
-    event_action
-
-    FROM dim_span
-
-    WHERE layer IS NULL
-
-    ORDER BY event_action
-
-    """).fetchall()
-
-    print(f"✓ {len(missing)} span(s) require classification")
-
-    if missing:
-
-        print()
-
-        print("Spans awaiting classification:\n")
-
-        for row in missing:
-
-            print(f" • {row[0]}")
-
-    print()
-    print_instrumentation_backlog(gap_pending, "COBRAND")
-
-    return processed_files
-
-
-if __name__ == "__main__":
-    refresh()
+    # in that case would silently wipe out e
