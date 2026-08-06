@@ -28,7 +28,7 @@ st.title("Raw Log Search")
 
 col1, col2 = st.columns([2, 1])
 with col1:
-    search = st.text_input("Search message / error text", "")
+    search = st.text_input("Search message / error text / event action", "")
 with col2:
     source = st.selectbox("Source", options=["Both", "API", "Cobrand"])
 
@@ -72,7 +72,7 @@ except WarehouseBusyError:
     st.warning("The warehouse is currently being refreshed. Please try again in a few seconds.")
     st.stop()
 
-st.caption(f"{len(results)} result(s), capped at 200.")
+st.caption(f"{len(results)} result(s), capped at 5,000. Searches message, error text, stack traces, and event action.")
 
 if results.empty:
     st.caption("No matches.")
