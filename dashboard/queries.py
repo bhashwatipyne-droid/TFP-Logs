@@ -50,7 +50,12 @@ from etl.instrumentation_gap import normalized_message_sql, _first_line_sql
 
 logger = logging.getLogger(__name__)
 
-CACHE_TTL_SECONDS = 60
+CACHE_TTL_SECONDS = 3600  # 1 hour — data only changes once/day via the
+                          # cron sync + redeploy, which creates a FRESH
+                          # container (fresh cache too), so a long TTL
+                          # never risks showing stale data across
+                          # deploys, only reduces needless re-querying
+                          # within one already-running container.
 
 
 def _safe_int(value, default: int = 0) -> int:
