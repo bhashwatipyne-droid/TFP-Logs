@@ -548,13 +548,16 @@ def get_top_planners_with_errors(start_date, end_date, limit: int = 10) -> pd.Da
 
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def get_failure_table(start_date, end_date, search: str = "", limit: int = 200) -> pd.DataFrame:
+def get_failure_table(start_date, end_date, search: str = "", limit: int = 5000) -> pd.DataFrame:
     """
     Combined, expandable failure table (API + Cobrand). search matches
     against message/error text (case-insensitive substring), applied
-    the same way on both sides. Capped at `limit` rows — this is an
-    investigation table for a human to scan, not a full export (use
-    Raw Log Search for that).
+    the same way on both sides. `limit` is a SAFETY CAP on how much
+    data gets fetched from the database, not the number of rows shown
+    on screen at once — the page itself paginates the returned
+    DataFrame (see pages/2_Failure_Explorer.py), since rendering
+    thousands of expandable Streamlit widgets simultaneously is a
+    browser-performance problem independent of how fast this query is.
     """
     frames = []
     like_param = f"%{search}%" if search else "%"
@@ -963,6 +966,30 @@ def get_instrumentation_gap_table(source_system: str = "All", search: str = "") 
 # Raw Log Search
 # ---------------------------------------------------------------------
 
+def _find_matching_raw_patterns(search: str) -> list:
+    """
+    If `search` matches a signature (or the raw_pattern itself) in
+    instrumentation_gap_catalog, return the distinct raw_pattern
+    values so callers can also find raw log lines that NORMALIZE to
+    one of those patterns — not just lines that literally contain the
+    search text. This is what makes searching a resolved signature
+    like "VIDEO_MAX_FPS_TOO_LOW" actually find anything: that string
+    never appears in the raw log message itself (the real message says
+    something like "The Max FPS found from the video files does not
+    meet the minimum value..."), only in the catalog it resolved to.
+    """
+    if not search or not table_exists("instrumentation_gap_catalog"):
+        return []
+
+    df = run_query("""
+        SELECT DISTINCT raw_pattern
+        FROM instrumentation_gap_catalog
+        WHERE signature ILIKE ? OR raw_pattern ILIKE ?
+    """, [f"%{search}%", f"%{search}%"])
+
+    return df["raw_pattern"].dropna().tolist()
+
+
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def search_raw_logs(
     search: str = "",
@@ -970,26 +997,49 @@ def search_raw_logs(
     request_id: str = "",
     planner_id=None,
     source: str = "Both",
-    limit: int = 200,
+    limit: int = 5000,
 ) -> pd.DataFrame:
     """
     Search across both warehouses. Any blank/None filter is skipped.
-    This searches the already-parsed fact tables (message/error_message
-    columns), not the archived raw JSON — searching archived Parquet
-    directly would need its own tool, deferred until there's a
-    concrete need to search data that's already been deleted from
-    these tables (there isn't one yet — nothing is deleted from
-    event_fact_api/span_fact, only the source .log files are).
+
+    Searches message, error_message, error_stack, AND event_action —
+    error_stack (full stack trace text) was a real gap until now: it
+    exists as a real column on every source table but was never
+    searched, meaning a term that only appears deep in a stack trace
+    (not in the shorter message/error_message fields) was invisible
+    to this search regardless of how the term was typed.
+
+    This searches the already-parsed fact tables, not the archived raw
+    JSON — searching archived Parquet directly would need its own
+    tool, deferred until there's a concrete need to search data that's
+    already been deleted from these tables (there isn't one yet —
+    nothing is deleted from event_fact_api/span_fact/cobrand_event_fact,
+    only the source .log files are).
+
+    `limit` is a safety cap on data fetched, not rows rendered at once
+    — see pages/7_Raw_Log_Search.py for pagination.
     """
     frames = []
     like_param = f"%{search}%" if search else None
+
+    # If the search term matches a known signature/pattern, also catch
+    # raw log lines that normalize to it, even though the search text
+    # itself never appears verbatim in those lines.
+    matching_patterns = _find_matching_raw_patterns(search) if search else []
 
     if source in ("Both", "API") and table_exists("event_fact_api"):
         where_clauses = ["1=1"]
         params = []
         if like_param:
-            where_clauses.append("(message ILIKE ? OR error_message ILIKE ?)")
-            params.extend([like_param, like_param])
+            text_clause = "(message ILIKE ? OR error_message ILIKE ? OR error_stack ILIKE ? OR event_action ILIKE ?)"
+            text_params = [like_param, like_param, like_param, like_param]
+            if matching_patterns:
+                pattern_expr = normalized_message_sql(_first_line_sql("message"))
+                placeholders = ", ".join(["?"] * len(matching_patterns))
+                text_clause = f"({text_clause} OR {pattern_expr} IN ({placeholders}))"
+                text_params = text_params + list(matching_patterns)
+            where_clauses.append(text_clause)
+            params.extend(text_params)
         if user_id:
             where_clauses.append("user_id = ?")
             params.append(user_id)
@@ -1006,7 +1056,7 @@ def search_raw_logs(
                 'API' AS source,
                 {CAPABILITY_TIMESTAMP_SQL} AS event_time,
                 event_action, level, service_name, user_id,
-                request_id, planner_id, message, error_message
+                request_id, planner_id, message, error_message, error_stack
             FROM event_fact_api
             WHERE {where_sql}
             ORDER BY {CAPABILITY_TIMESTAMP_SQL} DESC
@@ -1018,8 +1068,15 @@ def search_raw_logs(
         where_clauses = ["1=1"]
         params = []
         if like_param:
-            where_clauses.append("error_message ILIKE ?")
-            params.append(like_param)
+            text_clause = "(error_message ILIKE ? OR error_stack ILIKE ? OR event_action ILIKE ?)"
+            text_params = [like_param, like_param, like_param]
+            if matching_patterns:
+                pattern_expr = normalized_message_sql(_first_line_sql("error_message"))
+                placeholders = ", ".join(["?"] * len(matching_patterns))
+                text_clause = f"({text_clause} OR {pattern_expr} IN ({placeholders}))"
+                text_params = text_params + list(matching_patterns)
+            where_clauses.append(text_clause)
+            params.extend(text_params)
         if user_id:
             where_clauses.append("user_id = ?")
             params.append(user_id)
@@ -1038,8 +1095,56 @@ def search_raw_logs(
                 user_id, request_id,
                 CAST(NULL AS BIGINT) AS planner_id,
                 CAST(NULL AS VARCHAR) AS message,
-                error_message
+                error_message, error_stack
             FROM span_fact
+            WHERE {where_sql}
+            ORDER BY {COBRAND_TIMESTAMP_SQL} DESC
+            LIMIT {int(limit)}
+        """, params)
+        frames.append(df)
+
+    # cobrand_event_fact holds STANDALONE Cobrand events (no trace) —
+    # a genuinely different table from span_fact. This is specifically
+    # where instrumentation_gap_catalog's Cobrand-side patterns come
+    # from (see etl/cobrand_loader.py's sync wiring), so a signature
+    # search that only checked span_fact would silently miss anything
+    # that never got wrapped inside a trace — confirmed directly:
+    # searching a known signature came back with 0 results because the
+    # underlying message lived here, not in span_fact.
+    if source in ("Both", "Cobrand") and table_exists("cobrand_event_fact") and not planner_id:
+        where_clauses = ["1=1"]
+        params = []
+        if like_param:
+            text_clause = "(message ILIKE ? OR error_message ILIKE ? OR error_stack ILIKE ? OR event_action ILIKE ?)"
+            text_params = [like_param, like_param, like_param, like_param]
+            if matching_patterns:
+                pattern_expr = normalized_message_sql(_first_line_sql("message"))
+                placeholders = ", ".join(["?"] * len(matching_patterns))
+                text_clause = f"({text_clause} OR {pattern_expr} IN ({placeholders}))"
+                text_params = text_params + list(matching_patterns)
+            where_clauses.append(text_clause)
+            params.extend(text_params)
+        if user_id:
+            where_clauses.append("TRY_CAST(user_id AS BIGINT) = ?")
+            params.append(user_id)
+        if request_id:
+            where_clauses.append("request_id = ?")
+            params.append(request_id)
+
+        where_sql = " AND ".join(where_clauses)
+        df = run_query(f"""
+            SELECT
+                'Cobrand' AS source,
+                {COBRAND_TIMESTAMP_SQL} AS event_time,
+                event_action,
+                level,
+                source_file AS service_name,
+                TRY_CAST(user_id AS BIGINT) AS user_id,
+                request_id,
+                CAST(NULL AS BIGINT) AS planner_id,
+                message,
+                error_message, error_stack
+            FROM cobrand_event_fact
             WHERE {where_sql}
             ORDER BY {COBRAND_TIMESTAMP_SQL} DESC
             LIMIT {int(limit)}
@@ -1049,7 +1154,7 @@ def search_raw_logs(
     if not frames:
         return pd.DataFrame(columns=[
             "source", "event_time", "event_action", "level", "service_name",
-            "user_id", "request_id", "planner_id", "message", "error_message",
+            "user_id", "request_id", "planner_id", "message", "error_message", "error_stack",
         ])
 
     combined = pd.concat(frames, ignore_index=True)
