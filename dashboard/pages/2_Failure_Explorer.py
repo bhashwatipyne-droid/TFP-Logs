@@ -5,7 +5,7 @@ Investigate failures across both warehouses: timeline, distribution,
 top failing events/messages/users/planners, and an expandable table.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as time_type
 
 import streamlit as st
 
@@ -37,6 +37,13 @@ date_range = st.sidebar.date_input(
     value=(default_start.date() if hasattr(default_start, "date") else default_start,
            default_end.date() if hasattr(default_end, "date") else default_end),
 )
+
+time_col1, time_col2 = st.sidebar.columns(2)
+with time_col1:
+    start_time = st.time_input("Start time", value=time_type(0, 0))
+with time_col2:
+    end_time = st.time_input("End time", value=time_type(23, 59, 59))
+
 search = st.sidebar.text_input("Search error text", "")
 
 if len(date_range) != 2:
@@ -44,8 +51,12 @@ if len(date_range) != 2:
     st.stop()
 
 start_date, end_date = date_range
-start_datetime = datetime.combine(start_date, datetime.min.time())
-end_datetime = datetime.combine(end_date, datetime.max.time())
+start_datetime = datetime.combine(start_date, start_time)
+end_datetime = datetime.combine(end_date, end_time)
+
+if start_datetime > end_datetime:
+    st.error("Start date/time must be before end date/time.")
+    st.stop()
 
 try:
     dist_df = queries.get_failure_distribution_by_source(start_datetime, end_datetime)
