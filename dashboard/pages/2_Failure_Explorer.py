@@ -135,14 +135,53 @@ with col6:
 st.divider()
 
 st.subheader("Failure Table")
-st.caption("Every row is expandable. Capped at 200 rows for investigation — use Raw Log Search to export more.")
+st.caption(
+    "Every row is expandable. Fetches up to 5,000 matching rows; "
+    "shown in pages below to keep the browser responsive — rendering "
+    "thousands of expandable rows at once would make the page slow "
+    "regardless of how fast the underlying query is."
+)
 
 failure_table = queries.get_failure_table(start_datetime, end_datetime, search=search)
 
 if failure_table.empty:
     st.caption("No matching failures.")
 else:
-    for _, row in failure_table.iterrows():
+    total_rows = len(failure_table)
+
+    page_col1, page_col2 = st.columns([1, 3])
+    with page_col1:
+        page_size = st.selectbox("Rows per page", [25, 50, 100, 200], index=1)
+
+    total_pages = max(1, (total_rows + page_size - 1) // page_size)
+
+    if "failure_table_page" not in st.session_state:
+        st.session_state.failure_table_page = 1
+    # Reset to page 1 if filters changed and the current page no longer exists
+    if st.session_state.failure_table_page > total_pages:
+        st.session_state.failure_table_page = 1
+
+    with page_col2:
+        nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+        with nav_col1:
+            if st.button("Previous", disabled=st.session_state.failure_table_page <= 1):
+                st.session_state.failure_table_page -= 1
+        with nav_col2:
+            st.markdown(
+                f"<div style='text-align:center; padding-top:6px;'>"
+                f"Page {st.session_state.failure_table_page} of {total_pages} "
+                f"({total_rows:,} total matching rows)</div>",
+                unsafe_allow_html=True,
+            )
+        with nav_col3:
+            if st.button("Next", disabled=st.session_state.failure_table_page >= total_pages):
+                st.session_state.failure_table_page += 1
+
+    start_idx = (st.session_state.failure_table_page - 1) * page_size
+    end_idx = start_idx + page_size
+    page_df = failure_table.iloc[start_idx:end_idx]
+
+    for _, row in page_df.iterrows():
         header = f"{row['event_time']} · {row['source']} · {format_event_label(row)}"
         with st.expander(header):
             st.json(row.to_dict())
