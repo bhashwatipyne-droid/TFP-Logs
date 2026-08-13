@@ -67,38 +67,23 @@ start_datetime = datetime.combine(start_date, datetime.min.time())
 
 try:
     kpis = queries.get_kpis(start_datetime, end_datetime)
-    structured = queries.get_structured_event_rate(start_datetime, end_datetime)
+    breakdown = queries.get_failure_breakdown(start_datetime, end_datetime)
 except WarehouseBusyError:
     st.warning("The warehouse is currently being refreshed. Please try again in a few seconds.")
     st.stop()
 
 metric_row([
-    {"label": "Total Events", "value": format_count(kpis["total_events"])},
     {"label": "Errors", "value": format_count(kpis["errors"])},
     {"label": "Warnings", "value": format_count(kpis["warnings"])},
-    {"label": "Unique Users", "value": format_count(kpis["unique_users"])},
-])
-
-metric_row([
-    {"label": "Requests", "value": format_count(kpis["requests"])},
-    {"label": "Error Rate", "value": format_percent(kpis["error_rate"])},
-    {"label": "Success Rate", "value": format_percent(kpis["success_rate"])},
-    {"label": "Avg Duration", "value": format_ms(kpis["avg_duration_ms"])},
-])
-
-metric_row([
-    {"label": "Structured Event Rate", "value": format_percent(structured["structured_rate"])},
-    {"label": "Structured Events", "value": format_count(structured["structured"])},
-    {"label": "Unstructured Events", "value": format_count(structured["unstructured"])},
+    {"label": "Cobrand Failures", "value": format_count(breakdown["cobrand_failures"])},
+    {"label": "Posting Failures", "value": format_count(breakdown["posting_failures"])},
 ])
 
 st.caption(
     "Errors combine event_fact_api (level = 'error') and span_fact "
-    "(error_message IS NOT NULL). Avg Duration is API-only. "
-    "Structured Event Rate is the share of API events with a real "
-    "event_action (API only) — distinct from Capability Coverage's "
-    "'coverage', which measures human classification of the KNOWN "
-    "structured event set, not whether events are structured at all."
+    "(error_message IS NOT NULL). Cobrand Failures is the Cobrand-only "
+    "portion of Errors. Posting Failures is event_action LIKE "
+    "'posting_job%' AND level = 'error' (API)."
 )
 
 st.divider()
