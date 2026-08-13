@@ -14,7 +14,13 @@ def metric_row(metrics: list[dict]):
     """
     Render a row of st.metric cards.
 
-    metrics: list of dicts like {"label": "Total Events", "value": "1,234", "delta": None}
+    metrics: list of dicts like:
+        {"label": "Errors", "value": "1,234", "delta": "+56",
+         "delta_color": "inverse"}
+    delta_color follows st.metric's own values: "normal" (up=green,
+    default), "inverse" (up=red — use for "lower is better" metrics
+    like error counts), or "off" (no color). Defaults to "normal" if
+    omitted.
     """
     cols = st.columns(len(metrics))
     for col, m in zip(cols, metrics):
@@ -23,6 +29,7 @@ def metric_row(metrics: list[dict]):
                 label=m["label"],
                 value=m["value"],
                 delta=m.get("delta"),
+                delta_color=m.get("delta_color", "normal"),
             )
 
 
