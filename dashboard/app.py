@@ -28,12 +28,12 @@ st.markdown("""
 Use the sidebar to navigate:
 
 - **Executive Dashboard** — platform-wide KPIs and trends
+- **Social Media Platform Health** — service and platform-level health
 - **Failure Explorer** — investigate failures across both warehouses
 - **User Investigation** — search by User ID, see full activity history
 - **Workflow Explorer** — chronological event sequence for a Request/Planner/User ID
 - **Capability Coverage** — the Event Registry and its classification progress
 - **Instrumentation Gaps** — recurring unstructured messages awaiting review
 - **Raw Log Search** — search across both warehouses, export to CSV
-- **Platform Health** — service and platform-level health
 - **Settings** — warehouse status and ETL configuration (read-only)
 """)
