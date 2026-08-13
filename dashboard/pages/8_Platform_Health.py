@@ -20,11 +20,11 @@ from components import metric_row, format_count, format_percent, render_warehous
 from database import WarehouseBusyError
 import queries
 
-st.set_page_config(page_title="Platform Health — Logs360", layout="wide")
+st.set_page_config(page_title="Social Media Platform Health — Logs360", layout="wide")
 inject_dark_theme()
 render_warehouse_status_badge()
 
-st.title("Platform Health")
+st.title("Social Media Platform Health")
 st.info(
     "Built from service_name and platform_name (real columns) rather than a "
     "named subsystem list (Posting/Scheduler/Auth/etc.), which the current "
