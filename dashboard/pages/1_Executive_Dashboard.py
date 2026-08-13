@@ -72,18 +72,46 @@ except WarehouseBusyError:
     st.warning("The warehouse is currently being refreshed. Please try again in a few seconds.")
     st.stop()
 
+# Day-over-day comparison: the LAST day of the selected range vs the
+# day immediately before it — works sensibly whether the selected
+# range is a single day or a long historical window, since it always
+# compares the most recent day shown against its predecessor.
+today_start = datetime.combine(end_date, datetime.min.time())
+today_end = datetime.combine(end_date, datetime.max.time())
+yesterday = end_date - timedelta(days=1)
+yesterday_start = datetime.combine(yesterday, datetime.min.time())
+yesterday_end = datetime.combine(yesterday, datetime.max.time())
+
+try:
+    today_kpis = queries.get_kpis(today_start, today_end)
+    today_breakdown = queries.get_failure_breakdown(today_start, today_end)
+    yesterday_kpis = queries.get_kpis(yesterday_start, yesterday_end)
+    yesterday_breakdown = queries.get_failure_breakdown(yesterday_start, yesterday_end)
+
+    def _delta(today_val, yesterday_val):
+        d = today_val - yesterday_val
+        return f"{d:+,}" if d != 0 else None
+
+    errors_delta = _delta(today_kpis["errors"], yesterday_kpis["errors"])
+    warnings_delta = _delta(today_kpis["warnings"], yesterday_kpis["warnings"])
+    cobrand_delta = _delta(today_breakdown["cobrand_failures"], yesterday_breakdown["cobrand_failures"])
+    posting_delta = _delta(today_breakdown["posting_failures"], yesterday_breakdown["posting_failures"])
+except WarehouseBusyError:
+    errors_delta = warnings_delta = cobrand_delta = posting_delta = None
+
 metric_row([
-    {"label": "Errors", "value": format_count(kpis["errors"])},
-    {"label": "Warnings", "value": format_count(kpis["warnings"])},
-    {"label": "Cobrand Failures", "value": format_count(breakdown["cobrand_failures"])},
-    {"label": "Posting Failures", "value": format_count(breakdown["posting_failures"])},
+    {"label": "Errors", "value": format_count(kpis["errors"]), "delta": errors_delta, "delta_color": "inverse"},
+    {"label": "Warnings", "value": format_count(kpis["warnings"]), "delta": warnings_delta, "delta_color": "inverse"},
+    {"label": "Cobrand Failures", "value": format_count(breakdown["cobrand_failures"]), "delta": cobrand_delta, "delta_color": "inverse"},
+    {"label": "Posting Failures", "value": format_count(breakdown["posting_failures"]), "delta": posting_delta, "delta_color": "inverse"},
 ])
 
 st.caption(
     "Errors combine event_fact_api (level = 'error') and span_fact "
     "(error_message IS NOT NULL). Cobrand Failures is the Cobrand-only "
     "portion of Errors. Posting Failures is event_action LIKE "
-    "'posting_job%' AND level = 'error' (API)."
+    "'posting_job%' AND level = 'error' (API). Arrows compare the last "
+    "day of the selected range against the day before it."
 )
 
 st.divider()
