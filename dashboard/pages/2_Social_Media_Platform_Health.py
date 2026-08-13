@@ -1,5 +1,5 @@
 """
-pages/8_Platform_Health.py
+pages/2_Social_Media_Platform_Health.py
 
 SCOPE NOTE (also shown in the UI): the original spec asked for one
 card per named subsystem (API, Cobrand, Posting, Scheduler,
