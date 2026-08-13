@@ -239,6 +239,45 @@ def get_date_bounds() -> dict:
 # ---------------------------------------------------------------------
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def get_failure_breakdown(start_date, end_date) -> dict:
+    """
+    Two specific failure counts for the Executive Dashboard's trimmed
+    KPI row: Cobrand failures (span_fact.error_message IS NOT NULL —
+    the same definition get_kpis uses internally for its combined
+    error count, just exposed on its own here) and posting failures
+    (event_action LIKE 'posting_job%' AND level = 'error' — the real
+    prefix convention seen throughout this data: posting_job.started,
+    posting_job.failed, posting_job.twitter.failed, etc.).
+    """
+    cobrand_failures = 0
+    posting_failures = 0
+
+    if table_exists("span_fact"):
+        df = run_query(f"""
+            SELECT COUNT(*) AS n
+            FROM span_fact
+            WHERE {COBRAND_TIMESTAMP_SQL} BETWEEN ? AND ?
+              AND error_message IS NOT NULL
+        """, [start_date, end_date])
+        cobrand_failures = _safe_int(df["n"].iloc[0]) if not df.empty else 0
+
+    if table_exists("event_fact_api"):
+        df = run_query(f"""
+            SELECT COUNT(*) AS n
+            FROM event_fact_api
+            WHERE {CAPABILITY_TIMESTAMP_SQL} BETWEEN ? AND ?
+              AND event_action LIKE 'posting_job%'
+              AND LOWER(level) = 'error'
+        """, [start_date, end_date])
+        posting_failures = _safe_int(df["n"].iloc[0]) if not df.empty else 0
+
+    return {
+        "cobrand_failures": cobrand_failures,
+        "posting_failures": posting_failures,
+    }
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
 def get_kpis(start_date, end_date) -> dict:
     """
     Core Executive Dashboard KPIs, combined across the API and Cobrand
