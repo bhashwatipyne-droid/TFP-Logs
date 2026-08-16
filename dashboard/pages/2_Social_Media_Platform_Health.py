@@ -1,5 +1,5 @@
 """
-pages/2_Social_Media_Platform_Health.py
+pages/8_Platform_Health.py
 
 SCOPE NOTE (also shown in the UI): the original spec asked for one
 card per named subsystem (API, Cobrand, Posting, Scheduler,
@@ -61,6 +61,23 @@ except WarehouseBusyError:
     st.warning("The warehouse is currently being refreshed. Please try again in a few seconds.")
     st.stop()
 
+st.subheader("Platforms")
+if platform_health.empty:
+    st.caption("No platform data in the selected range.")
+else:
+    cols = st.columns(min(4, len(platform_health)))
+    for i, (_, row) in enumerate(platform_health.iterrows()):
+        with cols[i % len(cols)]:
+            st.metric(
+                label=row["platform_name"],
+                value=f"{int(row['requests']):,} req",
+                delta=f"{row['error_rate']:.1f}% errors",
+                delta_color="inverse",
+            )
+    st.dataframe(platform_health, use_container_width=True, hide_index=True)
+
+st.divider()
+
 st.subheader("Cobrand")
 metric_row([
     {"label": "Requests", "value": format_count(cobrand_health["requests"])},
@@ -84,20 +101,3 @@ else:
                 delta_color="inverse",
             )
     st.dataframe(service_health, use_container_width=True, hide_index=True)
-
-st.divider()
-
-st.subheader("Platforms")
-if platform_health.empty:
-    st.caption("No platform data in the selected range.")
-else:
-    cols = st.columns(min(4, len(platform_health)))
-    for i, (_, row) in enumerate(platform_health.iterrows()):
-        with cols[i % len(cols)]:
-            st.metric(
-                label=row["platform_name"],
-                value=f"{int(row['requests']):,} req",
-                delta=f"{row['error_rate']:.1f}% errors",
-                delta_color="inverse",
-            )
-    st.dataframe(platform_health, use_container_width=True, hide_index=True)
